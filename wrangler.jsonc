@@ -1,3 +1,4 @@
+
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "ai-photo-video-bot",
@@ -7,7 +8,7 @@
     {
       "binding": "DB",
       "database_name": "ai-photo-video-db",
-      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+      "database_id": "a7cb5cb0-e127-4847-919c-006d5474e289"
     }
   ]
 }
