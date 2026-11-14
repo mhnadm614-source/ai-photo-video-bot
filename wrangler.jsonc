@@ -4,6 +4,9 @@
   "name": "ai-photo-video-bot",
   "main": "worker.js",
   "compatibility_date": "2026-11-12",
+  "ai": {
+    "binding": "AI"
+  },
   "d1_databases": [
     {
       "binding": "DB",
