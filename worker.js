@@ -1,6 +1,7 @@
 
 const API = "https://api.telegram.org";
 const OWNER_ID = 8251907486;
+const IMAGE_MODEL = "@cf/black-forest-labs/flux-2-klein-4b";
 
 export default {
   async fetch(request, env) {
@@ -18,7 +19,7 @@ export default {
       const result = await telegram(env, "setWebhook", {
         url: `${url.origin}/telegram`,
         secret_token: env.WEBHOOK_SECRET,
-        allowed_updates: ["message", "callback_query"],
+        allowed_updates: ["message"],
         drop_pending_updates: false
       });
 
@@ -26,7 +27,9 @@ export default {
     }
 
     if (url.pathname === "/telegram" && request.method === "POST") {
-      const secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
+      const secret = request.headers.get(
+        "X-Telegram-Bot-Api-Secret-Token"
+      );
 
       if (!env.WEBHOOK_SECRET || secret !== env.WEBHOOK_SECRET) {
         return new Response("Unauthorized", { status: 401 });
@@ -34,18 +37,9 @@ export default {
 
       try {
         const update = await request.json();
-
-        if (update.message) {
-          await handleMessage(update.message, env);
-        }
-
-        if (update.callback_query) {
-          await telegram(env, "answerCallbackQuery", {
-            callback_query_id: update.callback_query.id
-          });
-        }
+        if (update.message) await handleMessage(update.message, env);
       } catch (error) {
-        console.error("Telegram update error:", error);
+        console.error("Webhook error:", error);
       }
 
       return new Response("OK");
@@ -56,11 +50,14 @@ export default {
 };
 
 async function telegram(env, method, payload) {
-  const response = await fetch(`${API}/bot${env.BOT_TOKEN}/${method}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload)
-  });
+  const response = await fetch(
+    `${API}/bot${env.BOT_TOKEN}/${method}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload)
+    }
+  );
 
   const data = await response.json();
 
@@ -95,6 +92,13 @@ async function ensureTables(env) {
         reason TEXT NOT NULL,
         created_at TEXT NOT NULL
       )
+    `),
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS pending_edits (
+        telegram_id INTEGER PRIMARY KEY,
+        file_id TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      )
     `)
   ]);
 }
@@ -113,15 +117,18 @@ async function ensureUser(env, from) {
 }
 
 async function registerUser(env, from, referrerId) {
-  const existing = await env.DB.prepare(
+  const oldUser = await env.DB.prepare(
     "SELECT telegram_id FROM users WHERE telegram_id = ?"
   ).bind(from.id).first();
 
   await ensureUser(env, from);
 
-  if (existing || !referrerId || !Number.isSafeInteger(referrerId) || referrerId === from.id) {
-    return;
-  }
+  if (
+    oldUser ||
+    !referrerId ||
+    !Number.isSafeInteger(referrerId) ||
+    referrerId === from.id
+  ) return;
 
   const referrer = await env.DB.prepare(
     "SELECT telegram_id FROM users WHERE telegram_id = ?"
@@ -129,17 +136,22 @@ async function registerUser(env, from, referrerId) {
 
   if (!referrer) return;
 
+  // يدعم أعمدة جدول referrals القديمة والجديدة
   const result = await env.DB.prepare(`
     INSERT OR IGNORE INTO referrals
-      (referrer_id, referred_user_id, created_at)
-    VALUES (?, ?, ?)
+      (inviter_id, invited_id, referrer_id, referred_user_id, created_at)
+    VALUES (?, ?, ?, ?, ?)
   `).bind(
+    referrerId,
+    from.id,
     referrerId,
     from.id,
     new Date().toISOString()
   ).run();
 
   if (result.meta?.changes > 0) {
+    const now = new Date().toISOString();
+
     await env.DB.batch([
       env.DB.prepare(
         "UPDATE users SET points = points + 5 WHERE telegram_id = ?"
@@ -149,20 +161,25 @@ async function registerUser(env, from, referrerId) {
         INSERT INTO point_transactions
           (telegram_id, amount, reason, created_at)
         VALUES (?, 5, 'دعوة صديق', ?)
-      `).bind(referrerId, new Date().toISOString())
+      `).bind(referrerId, now)
     ]);
 
     try {
-      await send(env, referrerId, "🎉 انضم صديق جديد عبر رابطك! حصلت على 5 نقاط.");
-    } catch (error) {
-      console.error("Referral notification:", error);
+      await send(
+        env,
+        referrerId,
+        "🎉 انضم صديق جديد عبر رابطك! حصلت على 5 نقاط."
+      );
+    } catch (e) {
+      console.error("Referral notification:", e);
     }
   }
 }
 
 async function claimDaily(env, userId) {
   const today = new Date().toISOString().slice(0, 10);
-  const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  const yesterday = new Date(Date.now() - 86400000)
+    .toISOString().slice(0, 10);
 
   const claim = await env.DB.prepare(`
     INSERT OR IGNORE INTO daily_claims
@@ -180,8 +197,7 @@ async function claimDaily(env, userId) {
 
   const old = await env.DB.prepare(`
     SELECT streak_count, last_claim_date
-    FROM user_streaks
-    WHERE telegram_id = ?
+    FROM user_streaks WHERE telegram_id = ?
   `).bind(userId).first();
 
   const streak = old?.last_claim_date === yesterday
@@ -212,14 +228,12 @@ async function claimDaily(env, userId) {
     `).bind(userId, now)
   ];
 
-  if (bonus > 0) {
-    statements.push(
-      env.DB.prepare(`
-        INSERT INTO point_transactions
-          (telegram_id, amount, reason, created_at)
-        VALUES (?, 10, 'مكافأة خمسة أيام متتالية', ?)
-      `).bind(userId, now)
-    );
+  if (bonus) {
+    statements.push(env.DB.prepare(`
+      INSERT INTO point_transactions
+        (telegram_id, amount, reason, created_at)
+      VALUES (?, 10, 'مكافأة خمسة أيام متتالية', ?)
+    `).bind(userId, now));
   }
 
   await env.DB.batch(statements);
@@ -236,7 +250,11 @@ async function claimDaily(env, userId) {
   };
 }
 
-async function archiveMedia(env, message, type, fileId) {
+async function archiveMedia(env, message, type) {
+  const fileId = type === "photo"
+    ? message.photo[message.photo.length - 1].file_id
+    : message.video.file_id;
+
   await env.DB.prepare(`
     INSERT INTO media_uploads
       (telegram_id, media_type, file_id, created_at)
@@ -248,10 +266,7 @@ async function archiveMedia(env, message, type, fileId) {
     new Date().toISOString()
   ).run();
 
-  if (!env.CHANNEL_ID) {
-    console.error("CHANNEL_ID is missing");
-    return;
-  }
+  if (!env.CHANNEL_ID) return;
 
   try {
     await telegram(env, "copyMessage", {
@@ -260,25 +275,158 @@ async function archiveMedia(env, message, type, fileId) {
       message_id: message.message_id
     });
 
-    const caption =
+    await send(env, env.CHANNEL_ID,
       `📥 أرشيف البوت\n` +
       `الاسم: ${message.from.first_name || "غير معروف"}\n` +
       `المعرف: ${message.from.username ? "@" + message.from.username : "لا يوجد"}\n` +
       `Telegram ID: ${message.from.id}\n` +
-      `النوع: ${type}`;
+      `النوع: ${type}`
+    );
+  } catch (e) {
+    console.error("Archive error:", e);
+  }
 
-    await send(env, env.CHANNEL_ID, caption);
+  return fileId;
+}
+
+async function getTelegramFile(env, fileId) {
+  const result = await telegram(env, "getFile", {
+    file_id: fileId
+  });
+
+  const url =
+    `${API}/file/bot${env.BOT_TOKEN}/${result.result.file_path}`;
+
+  const response = await fetch(url);
+
+  if (!response.ok) throw new Error("تعذر تحميل الصورة");
+
+  return await response.blob();
+}
+
+async function editImage(env, chatId, userId, fileId, prompt) {
+  const isOwner = userId === OWNER_ID;
+
+  if (!env.AI) {
+    await send(env, chatId, "خدمة تعديل الصور غير مفعّلة حالياً.");
+    return;
+  }
+
+  // خصم 3 نقاط من المستخدم العادي فقط
+  if (!isOwner) {
+    const deduction = await env.DB.prepare(`
+      UPDATE users
+      SET points = points - 3
+      WHERE telegram_id = ? AND points >= 3
+    `).bind(userId).run();
+
+    if (deduction.meta?.changes === 0) {
+      await send(env, chatId, "رصيدك غير كافٍ. تحتاج إلى 3 نقاط للتعديل.");
+      return;
+    }
+
+    await env.DB.prepare(`
+      INSERT INTO point_transactions
+        (telegram_id, amount, reason, created_at)
+      VALUES (?, -3, 'تعديل صورة', ?)
+    `).bind(userId, new Date().toISOString()).run();
+  }
+
+  try {
+    await send(env, chatId, "⏳ جارٍ تعديل الصورة بالذكاء الاصطناعي...");
+
+    const original = await getTelegramFile(env, fileId);
+
+    const form = new FormData();
+    form.append("prompt", prompt);
+    form.append("input_image_0", original, "original.jpg");
+    form.append("width", "1024");
+    form.append("height", "1024");
+    form.append("guidance", "4");
+
+    const serialized = new Response(form);
+
+    const result = await env.AI.run(IMAGE_MODEL, {
+      multipart: {
+        body: serialized.body,
+        contentType: serialized.headers.get("content-type")
+      }
+    });
+
+    const output = await new Response(result).blob();
+
+    if (!output.size) throw new Error("نتيجة الصورة فارغة");
+
+    const photoForm = new FormData();
+    photoForm.append("chat_id", String(chatId));
+    photoForm.append("photo", output, "edited.png");
+    photoForm.append("caption", "✨ هذه هي الصورة بعد التعديل");
+
+    const sent = await fetch(
+      `${API}/bot${env.BOT_TOKEN}/sendPhoto`,
+      { method: "POST", body: photoForm }
+    );
+
+    const sentData = await sent.json();
+    if (!sent.ok || !sentData.ok) {
+      throw new Error(sentData.description || "فشل إرسال الصورة");
+    }
+
+    // أرشفة النتيجة أيضاً
+    if (env.CHANNEL_ID) {
+      const archiveForm = new FormData();
+      archiveForm.append("chat_id", String(env.CHANNEL_ID));
+      archiveForm.append("photo", output, "edited.png");
+      archiveForm.append(
+        "caption",
+        `✅ نتيجة التعديل\nTelegram ID: ${userId}`
+      );
+
+      await fetch(
+        `${API}/bot${env.BOT_TOKEN}/sendPhoto`,
+        { method: "POST", body: archiveForm }
+      );
+    }
+
+    const user = await env.DB.prepare(
+      "SELECT points FROM users WHERE telegram_id = ?"
+    ).bind(userId).first();
+
+    if (!isOwner) {
+      await send(env, chatId, `رصيدك المتبقي: ${user?.points || 0} نقطة.`);
+    }
+
   } catch (error) {
-    console.error("Archive error:", error);
+    console.error("Image edit error:", error);
+
+    // إعادة النقاط عند فشل التعديل
+    if (!isOwner) {
+      await env.DB.batch([
+        env.DB.prepare(
+          "UPDATE users SET points = points + 3 WHERE telegram_id = ?"
+        ).bind(userId),
+
+        env.DB.prepare(`
+          INSERT INTO point_transactions
+            (telegram_id, amount, reason, created_at)
+          VALUES (?, 3, 'إعادة نقاط بسبب فشل التعديل', ?)
+        `).bind(userId, new Date().toISOString())
+      ]);
+    }
+
+    await send(
+      env,
+      chatId,
+      "تعذر تعديل الصورة هذه المرة. أُعيدت نقاطك إن تم خصمها. حاول بصورة أخرى."
+    );
   }
 }
 
 async function adminCommand(env, chatId, text) {
   const parts = text.split(/\s+/);
-  const command = parts[0];
+  const adding = parts[0] === "/addpoints";
   const target = Number(parts[1]);
   const amount = Number(parts[2]);
-  const adding = command === "/addpoints";
 
   if (
     !Number.isSafeInteger(target) ||
@@ -286,7 +434,9 @@ async function adminCommand(env, chatId, text) {
     amount < 1 ||
     amount > 100000
   ) {
-    await send(env, chatId, "الصيغة غير صحيحة.\nمثال:\n/addpoints 123456789 10");
+    await send(env, chatId,
+      "الصيغة:\n/addpoints رقم_المستخدم عدد_النقاط\n/deductpoints رقم_المستخدم عدد_النقاط"
+    );
     return;
   }
 
@@ -295,17 +445,16 @@ async function adminCommand(env, chatId, text) {
   ).bind(target).first();
 
   if (!user) {
-    await send(env, chatId, "هذا المستخدم غير مسجل في البوت.");
+    await send(env, chatId, "المستخدم غير مسجل.");
     return;
   }
 
   if (!adding && user.points < amount) {
-    await send(env, chatId, "رصيد المستخدم أقل من النقاط المطلوب خصمها.");
+    await send(env, chatId, "رصيد المستخدم غير كافٍ.");
     return;
   }
 
   const delta = adding ? amount : -amount;
-  const reason = adding ? "إضافة يدوية من المالك" : "خصم يدوي من المالك";
   const now = new Date().toISOString();
 
   await env.DB.batch([
@@ -317,14 +466,15 @@ async function adminCommand(env, chatId, text) {
       INSERT INTO point_transactions
         (telegram_id, amount, reason, created_at)
       VALUES (?, ?, ?, ?)
-    `).bind(target, delta, reason, now)
+    `).bind(
+      target,
+      delta,
+      adding ? "إضافة يدوية من المالك" : "خصم يدوي من المالك",
+      now
+    )
   ]);
 
-  await send(
-    env,
-    chatId,
-    `تم ${adding ? "إضافة" : "خصم"} ${amount} نقطة.\nمعرف المستخدم: ${target}`
-  );
+  await send(env, chatId, "تم تنفيذ العملية بنجاح.");
 }
 
 async function handleMessage(message, env) {
@@ -345,57 +495,50 @@ async function handleMessage(message, env) {
       : null;
 
     await registerUser(env, message.from, referrerId);
-    await send(env, chatId, "أهلاً بك في عالم الخيال ✨");
+    await send(env, chatId, "أهلاً بك");
     return;
   }
 
   await ensureUser(env, message.from);
 
-  if (text.startsWith("/daily")) {
+  if (text === "/daily") {
     const result = await claimDaily(env, userId);
 
     if (!result.claimed) {
-      await send(
-        env,
-        chatId,
-        `لقد حصلت على مكافأتك اليومية بالفعل.\nرصيدك: ${result.balance} نقطة.`
+      await send(env, chatId,
+        `أخذت مكافأتك اليوم بالفعل.\nرصيدك: ${result.balance} نقطة.`
       );
     } else {
-      const bonusText = result.bonus
-        ? "\n🏆 حصلت على 10 نقاط إضافية لإكمال خمسة أيام متتالية!"
-        : "";
-
-      await send(
-        env,
-        chatId,
-        `🎁 حصلت على 3 نقاط!\nأيام الاستمرار: ${result.streak}${bonusText}\nرصيدك الآن: ${result.balance} نقطة.`
+      await send(env, chatId,
+        `🎁 حصلت على 3 نقاط.\n` +
+        `أيام الاستمرار: ${result.streak}\n` +
+        (result.bonus ? "🏆 مكافأة إضافية: 10 نقاط!\n" : "") +
+        `رصيدك: ${result.balance} نقطة.`
       );
     }
     return;
   }
 
-  if (text.startsWith("/balance")) {
+  if (text === "/balance") {
     const user = await env.DB.prepare(
       "SELECT points FROM users WHERE telegram_id = ?"
     ).bind(userId).first();
 
-    await send(env, chatId, `رصيدك الحالي: ${user?.points || 0} نقطة.`);
+    await send(env, chatId, `رصيدك: ${user?.points || 0} نقطة.`);
     return;
   }
 
-  if (text.startsWith("/invite")) {
+  if (text === "/invite") {
     const me = await telegram(env, "getMe", {});
     const link = `https://t.me/${me.result.username}?start=ref_${userId}`;
 
-    await send(
-      env,
-      chatId,
-      `🎉 تحصل على 5 نقاط عن كل صديق جديد.\nرابط دعوتك:\n${link}\nتُحتسب الدعوة مرة واحدة لكل مستخدم.`
+    await send(env, chatId,
+      `رابط دعوتك:\n${link}\nتحصل على 5 نقاط عن كل صديق جديد.`
     );
     return;
   }
 
-  if (text.startsWith("/admin")) {
+  if (text === "/admin") {
     if (userId !== OWNER_ID) return;
 
     const stats = await env.DB.prepare(`
@@ -404,10 +547,12 @@ async function handleMessage(message, env) {
       FROM users
     `).first();
 
-    await send(
-      env,
-      chatId,
-      `لوحة المالك\nعدد المستخدمين: ${stats?.total || 0}\nمجموع النقاط: ${stats?.points || 0}\n\nإضافة نقاط:\n/addpoints رقم_المستخدم عدد_النقاط\n\nخصم نقاط:\n/deductpoints رقم_المستخدم عدد_النقاط`
+    await send(env, chatId,
+      `لوحة المالك\n` +
+      `المستخدمون: ${stats?.total || 0}\n` +
+      `مجموع النقاط: ${stats?.points || 0}\n\n` +
+      `/addpoints ID عدد\n` +
+      `/deductpoints ID عدد`
     );
     return;
   }
@@ -418,37 +563,64 @@ async function handleMessage(message, env) {
     return;
   }
 
-  if (text.startsWith("/help")) {
-    await send(
-      env,
-      chatId,
-      "أرسل صورة أو فيديو إلى البوت.\n/daily للمكافأة اليومية\n/balance لمعرفة رصيدك\n/invite لدعوة الأصدقاء"
-    );
-    return;
-  }
-
   if (message.photo) {
-    const photo = message.photo[message.photo.length - 1];
-    await archiveMedia(env, message, "photo", photo.file_id);
-    await send(env, chatId, "📷 وصلتني الصورة بنجاح، وتم حفظها في الأرشيف.");
+    const fileId = await archiveMedia(env, message, "photo");
+
+    if (!fileId) {
+      await send(env, chatId, "تعذر حفظ الصورة.");
+      return;
+    }
+
+    const caption = (message.caption || "").trim();
+
+    if (caption) {
+      await editImage(env, chatId, userId, fileId, caption);
+    } else {
+      await env.DB.prepare(`
+        INSERT INTO pending_edits (telegram_id, file_id, created_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(telegram_id) DO UPDATE SET
+          file_id = excluded.file_id,
+          created_at = excluded.created_at
+      `).bind(userId, fileId, new Date().toISOString()).run();
+
+      await send(env, chatId,
+        "أرسل وصف التعديل الذي تريده على الصورة."
+      );
+    }
     return;
   }
 
   if (message.video) {
-    await archiveMedia(env, message, "video", message.video.file_id);
-    await send(env, chatId, "🎬 وصلني الفيديو بنجاح، وتم حفظه في الأرشيف.");
+    await archiveMedia(env, message, "video");
+    await send(env, chatId,
+      "وصل الفيديو وتم حفظه في الأرشيف. تعديل الفيديو بالذكاء الاصطناعي غير متاح في النسخة المجانية حالياً."
+    );
     return;
   }
 
-  if (message.document) {
-    await archiveMedia(env, message, "document", message.document.file_id);
-    await send(env, chatId, "📎 وصلني الملف وتم حفظه في الأرشيف.");
-    return;
+  if (text && !text.startsWith("/")) {
+    const pending = await env.DB.prepare(
+      "SELECT file_id FROM pending_edits WHERE telegram_id = ?"
+    ).bind(userId).first();
+
+    if (pending) {
+      await env.DB.prepare(
+        "DELETE FROM pending_edits WHERE telegram_id = ?"
+      ).bind(userId).run();
+
+      await editImage(env, chatId, userId, pending.file_id, text);
+      return;
+    }
   }
 
-  await send(
-    env,
-    chatId,
-    "أهلاً بك في عالم الخيال ✨\nأرسل صورة أو فيديو لحفظه، أو استخدم /help."
-  );
+  if (text === "/help") {
+    await send(env, chatId,
+      "أرسل صورة ثم اكتب وصف التعديل.\n" +
+      "يمكنك أيضاً إرسال الصورة مع وصف في التعليق.\n" +
+      "/daily للمكافأة اليومية\n" +
+      "/balance لمعرفة رصيدك\n" +
+      "/invite لدعوة الأصدقاء"
+    );
+  }
 }
