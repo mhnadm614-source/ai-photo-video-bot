@@ -92,8 +92,8 @@ async function send(env, chatId, text, replyMarkup = null) {
 }
 async function showOwnerPanel(env, chatId) {
   const stats = await env.DB.prepare("SELECT COUNT(*) AS total FROM users").first();
-  await send(env, chatId, "⚙️ لوحة المالك\\nعدد المستخدمين: " + (stats?.total || 0) +
-    "\\n\\nيمكنك تعديل الصور دون نقاط، وإدارة أرصدة المستخدمين من أزرار إضافة أو خصم النقاط.", ownerKeyboard());
+  await send(env, chatId, "⚙️ لوحة المالك\nعدد المستخدمين: " + (stats?.total || 0) +
+    "\n\nيمكنك تعديل الصور دون نقاط، وإدارة أرصدة المستخدمين من أزرار إضافة أو خصم النقاط.", ownerKeyboard());
 }
 async function beginAdminAction(env, userId, action, chatId, prompt) {
   await env.DB.prepare("INSERT INTO admin_actions (telegram_id, action, created_at) VALUES (?, ?, ?) ON CONFLICT(telegram_id) DO UPDATE SET action = excluded.action, created_at = excluded.created_at")
