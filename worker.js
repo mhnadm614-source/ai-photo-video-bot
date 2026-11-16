@@ -329,7 +329,9 @@ async function claimDaily(env, userId) {
 async function archiveMedia(env, message, type) {
   const fileId = type === "photo"
     ? message.photo[message.photo.length - 1].file_id
-    : message.video.file_id;
+    : type === "image_document"
+      ? message.document.file_id
+      : message.video.file_id;
 
   await env.DB.prepare(`
     INSERT INTO media_uploads
@@ -652,8 +654,14 @@ async function handleMessage(message, env) {
     return;
   }
 
-  if (message.photo) {
-    const fileId = await archiveMedia(env, message, "photo");
+  const documentIsImage = message.document && (
+    (message.document.mime_type || "").toLowerCase().startsWith("image/") ||
+    /\\.(avif|bmp|gif|heic|heif|jfif|jpeg|jpg|png|tif|tiff|webp|svg)$/i.test(message.document.file_name || "")
+  );
+
+  if (message.photo || documentIsImage) {
+    const mediaType = message.photo ? "photo" : "image_document";
+    const fileId = await archiveMedia(env, message, mediaType);
 
     if (!fileId) {
       await send(env, chatId, "تعذر حفظ الصورة.");
