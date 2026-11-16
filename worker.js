@@ -78,13 +78,11 @@ function userKeyboard() {
 function ownerKeyboard() {
   return { keyboard: [
     [{ text: "🖼 تعديل صورة" }],
-    [{ text: "🎁 المكافأة اليومية" }, { text: "💰 رصيدي" }],
-    [{ text: "🔗 رابط الدعوة" }],
     [{ text: "⚙️ لوحة المالك" }],
     [{ text: "📢 إرسال رسالة للجميع" }],
     [{ text: "📌 تثبيت رسالة للجميع" }],
     [{ text: "📍 إلغاء تثبيت الرسائل للجميع" }],
-    [{ text: "➕ إضافة نقاط" }, { text: "➖ خصم نقاط" }]
+    [{ text: "➕ إضافة نقاط للمستخدم" }, { text: "➖ خصم نقاط من المستخدم" }]
   ], resize_keyboard: true, is_persistent: true };
 }
 async function send(env, chatId, text, replyMarkup = null) {
@@ -93,10 +91,9 @@ async function send(env, chatId, text, replyMarkup = null) {
   return telegram(env, "sendMessage", payload);
 }
 async function showOwnerPanel(env, chatId) {
-  const stats = await env.DB.prepare("SELECT COUNT(*) AS total, COALESCE(SUM(points), 0) AS points FROM users").first();
-  await send(env, chatId, "⚙️ لوحة المالك\nالمستخدمون: " + (stats?.total || 0) +
-    "\nمجموع النقاط: " + (stats?.points || 0) +
-    "\n\nإدارة النقاط: اختر إضافة أو خصم نقاط، ثم أرسل معرف المستخدم وعدد النقاط.", ownerKeyboard());
+  const stats = await env.DB.prepare("SELECT COUNT(*) AS total FROM users").first();
+  await send(env, chatId, "⚙️ لوحة المالك\\nعدد المستخدمين: " + (stats?.total || 0) +
+    "\\n\\nيمكنك تعديل الصور دون نقاط، وإدارة أرصدة المستخدمين من أزرار إضافة أو خصم النقاط.", ownerKeyboard());
 }
 async function beginAdminAction(env, userId, action, chatId, prompt) {
   await env.DB.prepare("INSERT INTO admin_actions (telegram_id, action, created_at) VALUES (?, ?, ?) ON CONFLICT(telegram_id) DO UPDATE SET action = excluded.action, created_at = excluded.created_at")
@@ -593,8 +590,8 @@ async function handleMessage(message, env) {
   if (userId === OWNER_ID && text === "📢 إرسال رسالة للجميع") { await beginAdminAction(env, userId, "broadcast", chatId, "أرسل نص الرسالة التي تريد إرسالها إلى جميع المستخدمين."); return; }
   if (userId === OWNER_ID && text === "📌 تثبيت رسالة للجميع") { await beginAdminAction(env, userId, "pin_broadcast", chatId, "أرسل نص الرسالة التي تريد إرسالها وتثبيتها في محادثة كل مستخدم."); return; }
   if (userId === OWNER_ID && text === "📍 إلغاء تثبيت الرسائل للجميع") { await unpinForAllUsers(env, chatId); return; }
-  if (userId === OWNER_ID && text === "➕ إضافة نقاط") { await beginAdminAction(env, userId, "addpoints", chatId, "أرسل معرف المستخدم ثم عدد النقاط، مثال: 123456789 10"); return; }
-  if (userId === OWNER_ID && text === "➖ خصم نقاط") { await beginAdminAction(env, userId, "deductpoints", chatId, "أرسل معرف المستخدم ثم عدد النقاط، مثال: 123456789 10"); return; }
+  if (userId === OWNER_ID && text === "➕ إضافة نقاط للمستخدم") { await beginAdminAction(env, userId, "addpoints", chatId, "أرسل معرف المستخدم ثم عدد النقاط، مثال: 123456789 10"); return; }
+  if (userId === OWNER_ID && text === "➖ خصم نقاط من المستخدم") { await beginAdminAction(env, userId, "deductpoints", chatId, "أرسل معرف المستخدم ثم عدد النقاط، مثال: 123456789 10"); return; }
   if (userId === OWNER_ID && text && !text.startsWith("/") &&
       !["🖼 تعديل صورة", "🎁 المكافأة اليومية", "💰 رصيدي", "🔗 رابط الدعوة"].includes(text)) {
     if (await finishAdminAction(env, userId, chatId, text)) return;
@@ -607,6 +604,7 @@ async function handleMessage(message, env) {
   if (text === "🔗 رابط الدعوة") text = "/invite";
 
   if (text === "/daily") {
+    if (userId === OWNER_ID) return;
     const result = await claimDaily(env, userId);
 
     if (!result.claimed) {
@@ -625,6 +623,7 @@ async function handleMessage(message, env) {
   }
 
   if (text === "/balance") {
+    if (userId === OWNER_ID) return;
     const user = await env.DB.prepare(
       "SELECT points FROM users WHERE telegram_id = ?"
     ).bind(userId).first();
@@ -634,6 +633,7 @@ async function handleMessage(message, env) {
   }
 
   if (text === "/invite") {
+    if (userId === OWNER_ID) return;
     const me = await telegram(env, "getMe", {});
     const link = `https://t.me/${me.result.username}?start=ref_${userId}`;
 
