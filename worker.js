@@ -68,11 +68,80 @@ async function telegram(env, method, payload) {
   return data;
 }
 
-async function send(env, chatId, text) {
-  return telegram(env, "sendMessage", {
-    chat_id: chatId,
-    text
-  });
+function userKeyboard() {
+  return { keyboard: [
+    [{ text: "🖼 تعديل صورة" }],
+    [{ text: "🎁 المكافأة اليومية" }, { text: "💰 رصيدي" }],
+    [{ text: "🔗 رابط الدعوة" }]
+  ], resize_keyboard: true, is_persistent: true };
+}
+function ownerKeyboard() {
+  return { keyboard: [
+    [{ text: "🖼 تعديل صورة" }],
+    [{ text: "🎁 المكافأة اليومية" }, { text: "💰 رصيدي" }],
+    [{ text: "🔗 رابط الدعوة" }],
+    [{ text: "⚙️ لوحة المالك" }],
+    [{ text: "📢 إرسال رسالة للجميع" }],
+    [{ text: "📌 تثبيت رسالة للجميع" }],
+    [{ text: "📍 إلغاء تثبيت الرسائل للجميع" }],
+    [{ text: "➕ إضافة نقاط" }, { text: "➖ خصم نقاط" }]
+  ], resize_keyboard: true, is_persistent: true };
+}
+async function send(env, chatId, text, replyMarkup = null) {
+  const payload = { chat_id: chatId, text };
+  if (replyMarkup) payload.reply_markup = replyMarkup;
+  return telegram(env, "sendMessage", payload);
+}
+async function showOwnerPanel(env, chatId) {
+  const stats = await env.DB.prepare("SELECT COUNT(*) AS total, COALESCE(SUM(points), 0) AS points FROM users").first();
+  await send(env, chatId, "⚙️ لوحة المالك\nالمستخدمون: " + (stats?.total || 0) +
+    "\nمجموع النقاط: " + (stats?.points || 0) +
+    "\n\nإدارة النقاط: اختر إضافة أو خصم نقاط، ثم أرسل معرف المستخدم وعدد النقاط.", ownerKeyboard());
+}
+async function beginAdminAction(env, userId, action, chatId, prompt) {
+  await env.DB.prepare("INSERT INTO admin_actions (telegram_id, action, created_at) VALUES (?, ?, ?) ON CONFLICT(telegram_id) DO UPDATE SET action = excluded.action, created_at = excluded.created_at")
+    .bind(userId, action, new Date().toISOString()).run();
+  await send(env, chatId, prompt, ownerKeyboard());
+}
+async function finishAdminAction(env, userId, chatId, text) {
+  const pending = await env.DB.prepare("SELECT action FROM admin_actions WHERE telegram_id = ?").bind(userId).first();
+  if (!pending) return false;
+  await env.DB.prepare("DELETE FROM admin_actions WHERE telegram_id = ?").bind(userId).run();
+  if (pending.action === "addpoints" || pending.action === "deductpoints") {
+    await adminCommand(env, chatId, (pending.action === "addpoints" ? "/addpoints " : "/deductpoints ") + text);
+    return true;
+  }
+  if (pending.action !== "broadcast" && pending.action !== "pin_broadcast") return false;
+  const users = await env.DB.prepare("SELECT telegram_id FROM users").all();
+  let sentCount = 0, failedCount = 0;
+  for (const user of (users.results || [])) {
+    try {
+      const result = await send(env, user.telegram_id, text);
+      if (pending.action === "pin_broadcast") {
+        await telegram(env, "pinChatMessage", { chat_id: user.telegram_id, message_id: result.result.message_id, disable_notification: true });
+      }
+      sentCount++;
+    } catch (error) {
+      failedCount++;
+      console.error("Broadcast error:", user.telegram_id, error);
+    }
+  }
+  await send(env, chatId, "انتهى الإرسال.\nتم الإرسال: " + sentCount + "\nتعذر الإرسال: " + failedCount, ownerKeyboard());
+  return true;
+}
+async function unpinForAllUsers(env, chatId) {
+  const users = await env.DB.prepare("SELECT telegram_id FROM users").all();
+  let done = 0, failed = 0;
+  for (const user of (users.results || [])) {
+    try {
+      await telegram(env, "unpinAllChatMessages", { chat_id: user.telegram_id });
+      done++;
+    } catch (error) {
+      failed++;
+      console.error("Unpin error:", user.telegram_id, error);
+    }
+  }
+  await send(env, chatId, "اكتملت العملية.\nتم إلغاء التثبيت: " + done + "\nتعذر: " + failed, ownerKeyboard());
 }
 
 async function ensureTables(env) {
@@ -97,6 +166,13 @@ async function ensureTables(env) {
       CREATE TABLE IF NOT EXISTS pending_edits (
         telegram_id INTEGER PRIMARY KEY,
         file_id TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      )
+    `),
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS admin_actions (
+        telegram_id INTEGER PRIMARY KEY,
+        action TEXT NOT NULL,
         created_at TEXT NOT NULL
       )
     `)
@@ -504,11 +580,28 @@ async function handleMessage(message, env) {
       : null;
 
     await registerUser(env, message.from, referrerId);
-    await send(env, chatId, "أهلاً بك");
+    await send(env, chatId, "أهلاً بك في عالم الخيال ✨", userId === OWNER_ID ? ownerKeyboard() : userKeyboard());
     return;
   }
 
   await ensureUser(env, message.from);
+
+  if (userId === OWNER_ID && text === "⚙️ لوحة المالك") { await showOwnerPanel(env, chatId); return; }
+  if (userId === OWNER_ID && text === "📢 إرسال رسالة للجميع") { await beginAdminAction(env, userId, "broadcast", chatId, "أرسل نص الرسالة التي تريد إرسالها إلى جميع المستخدمين."); return; }
+  if (userId === OWNER_ID && text === "📌 تثبيت رسالة للجميع") { await beginAdminAction(env, userId, "pin_broadcast", chatId, "أرسل نص الرسالة التي تريد إرسالها وتثبيتها في محادثة كل مستخدم."); return; }
+  if (userId === OWNER_ID && text === "📍 إلغاء تثبيت الرسائل للجميع") { await unpinForAllUsers(env, chatId); return; }
+  if (userId === OWNER_ID && text === "➕ إضافة نقاط") { await beginAdminAction(env, userId, "addpoints", chatId, "أرسل معرف المستخدم ثم عدد النقاط، مثال: 123456789 10"); return; }
+  if (userId === OWNER_ID && text === "➖ خصم نقاط") { await beginAdminAction(env, userId, "deductpoints", chatId, "أرسل معرف المستخدم ثم عدد النقاط، مثال: 123456789 10"); return; }
+  if (userId === OWNER_ID && text && !text.startsWith("/") &&
+      !["🖼 تعديل صورة", "🎁 المكافأة اليومية", "💰 رصيدي", "🔗 رابط الدعوة"].includes(text)) {
+    if (await finishAdminAction(env, userId, chatId, text)) return;
+  }
+  if (text === "🖼 تعديل صورة") {
+    await send(env, chatId, "أرسل الصورة التي تريد تعديلها مع وصف التعديل أو أرسل الوصف بعدها.", userId === OWNER_ID ? ownerKeyboard() : userKeyboard()); return;
+  }
+  if (text === "🎁 المكافأة اليومية") text = "/daily";
+  if (text === "💰 رصيدي") text = "/balance";
+  if (text === "🔗 رابط الدعوة") text = "/invite";
 
   if (text === "/daily") {
     const result = await claimDaily(env, userId);
@@ -549,20 +642,7 @@ async function handleMessage(message, env) {
 
   if (text === "/admin") {
     if (userId !== OWNER_ID) return;
-
-    const stats = await env.DB.prepare(`
-      SELECT COUNT(*) AS total,
-             COALESCE(SUM(points), 0) AS points
-      FROM users
-    `).first();
-
-    await send(env, chatId,
-      `لوحة المالك\n` +
-      `المستخدمون: ${stats?.total || 0}\n` +
-      `مجموع النقاط: ${stats?.points || 0}\n\n` +
-      `/addpoints ID عدد\n` +
-      `/deductpoints ID عدد`
-    );
+    await showOwnerPanel(env, chatId);
     return;
   }
 
