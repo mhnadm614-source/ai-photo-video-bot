@@ -353,7 +353,16 @@ async function editImage(env, chatId, userId, fileId, prompt) {
       }
     });
 
-    const output = await new Response(result).blob();
+    // Workers AI يعيد الصورة في result.image كسلسلة Base64، وليس كاستجابة صورة مباشرة.
+    if (!result || typeof result.image !== "string" || !result.image) {
+      throw new Error("لم يُرجع نموذج الصور بيانات صورة صالحة");
+    }
+
+    const imageBytes = Uint8Array.from(
+      atob(result.image),
+      character => character.charCodeAt(0)
+    );
+    const output = new Blob([imageBytes], { type: "image/png" });
 
     if (!output.size) throw new Error("نتيجة الصورة فارغة");
 
