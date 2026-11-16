@@ -571,7 +571,8 @@ async function handleMessage(message, env) {
 
   const userId = message.from.id;
   const chatId = message.chat.id;
-  const text = (message.text || "").trim();
+  const rawText = message.text || "";
+  let text = rawText.trim();
 
   await ensureTables(env);
 
@@ -668,9 +669,9 @@ async function handleMessage(message, env) {
       return;
     }
 
-    const caption = (message.caption || "").trim();
+    const caption = message.caption || "";
 
-    if (caption) {
+    if (caption.length > 0) {
       await editImage(env, chatId, userId, fileId, caption);
     } else {
       await env.DB.prepare(`
@@ -696,7 +697,7 @@ async function handleMessage(message, env) {
     return;
   }
 
-  if (text && !text.startsWith("/")) {
+  if (rawText.length > 0 && !rawText.trimStart().startsWith("/")) {
     const pending = await env.DB.prepare(
       "SELECT file_id FROM pending_edits WHERE telegram_id = ?"
     ).bind(userId).first();
@@ -706,7 +707,7 @@ async function handleMessage(message, env) {
         "DELETE FROM pending_edits WHERE telegram_id = ?"
       ).bind(userId).run();
 
-      await editImage(env, chatId, userId, pending.file_id, text);
+      await editImage(env, chatId, userId, pending.file_id, rawText);
       return;
     }
   }
