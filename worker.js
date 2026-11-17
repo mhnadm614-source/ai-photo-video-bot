@@ -605,16 +605,34 @@ async function handleMessage(message, env) {
   if (userId === OWNER_ID && text === "📍 إلغاء تثبيت الرسائل للجميع") { await unpinForAllUsers(env, chatId); return; }
   if (userId === OWNER_ID && text === "➕ إضافة نقاط للمستخدم") { await beginAdminAction(env, userId, "addpoints", chatId, "أرسل معرف المستخدم ثم عدد النقاط، مثال: 123456789 10"); return; }
   if (userId === OWNER_ID && text === "➖ خصم نقاط من المستخدم") { await beginAdminAction(env, userId, "deductpoints", chatId, "أرسل معرف المستخدم ثم عدد النقاط، مثال: 123456789 10"); return; }
+  const ownerMenuButtons = [
+    "🖼 تعديل صورة",
+    "👗 تبديل الملابس",
+    "⚙️ لوحة المالك",
+    "📢 إرسال رسالة للجميع",
+    "📌 تثبيت رسالة للجميع",
+    "📍 إلغاء تثبيت الرسائل للجميع",
+    "➕ إضافة نقاط للمستخدم",
+    "➖ خصم نقاط من المستخدم"
+  ];
   if (userId === OWNER_ID && text && !text.startsWith("/") &&
-      !["🖼 تعديل صورة", "🎁 المكافأة اليومية", "💰 رصيدي", "🔗 رابط الدعوة"].includes(text)) {
+      !ownerMenuButtons.includes(text) &&
+      !["🎁 المكافأة اليومية", "💰 رصيدي", "🔗 رابط الدعوة"].includes(text)) {
     if (await finishAdminAction(env, userId, chatId, text)) return;
   }
   if (text === "🖼 تعديل صورة") {
+    if (userId === OWNER_ID) {
+      await env.DB.prepare("DELETE FROM admin_actions WHERE telegram_id = ?").bind(userId).run();
+    }
     await env.DB.prepare("DELETE FROM pending_modes WHERE telegram_id = ?").bind(userId).run();
     await send(env, chatId, "أرسل الصورة التي تريد تعديلها مع وصف التعديل أو أرسل الوصف بعدها.", userId === OWNER_ID ? ownerKeyboard() : userKeyboard()); return;
   }
 
   if (text === "👗 تبديل الملابس") {
+    // اختيار أداة جديدة يلغي أي إدخال إداري سابق معلّق للمالك.
+    if (userId === OWNER_ID) {
+      await env.DB.prepare("DELETE FROM admin_actions WHERE telegram_id = ?").bind(userId).run();
+    }
     await env.DB.prepare(`
       INSERT INTO pending_modes (telegram_id, mode, created_at)
       VALUES (?, 'clothes_swap', ?)
