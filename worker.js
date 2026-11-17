@@ -70,14 +70,14 @@ async function telegram(env, method, payload) {
 
 function userKeyboard() {
   return { keyboard: [
-    [{ text: "🖼 تعديل صورة" }],
+    [{ text: "🖼 تعديل صورة" }, { text: "👗 تبديل الملابس" }],
     [{ text: "🎁 المكافأة اليومية" }, { text: "💰 رصيدي" }],
     [{ text: "🔗 رابط الدعوة" }]
   ], resize_keyboard: true, is_persistent: true };
 }
 function ownerKeyboard() {
   return { keyboard: [
-    [{ text: "🖼 تعديل صورة" }],
+    [{ text: "🖼 تعديل صورة" }, { text: "👗 تبديل الملابس" }],
     [{ text: "⚙️ لوحة المالك" }],
     [{ text: "📢 إرسال رسالة للجميع" }],
     [{ text: "📌 تثبيت رسالة للجميع" }],
@@ -163,6 +163,13 @@ async function ensureTables(env) {
       CREATE TABLE IF NOT EXISTS pending_edits (
         telegram_id INTEGER PRIMARY KEY,
         file_id TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      )
+    `),
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS pending_modes (
+        telegram_id INTEGER PRIMARY KEY,
+        mode TEXT NOT NULL,
         created_at TEXT NOT NULL
       )
     `),
@@ -379,8 +386,14 @@ async function getTelegramFile(env, fileId) {
   return await response.blob();
 }
 
-async function editImage(env, chatId, userId, fileId, prompt) {
+async function editImage(env, chatId, userId, fileId, prompt, mode = "normal") {
   const isOwner = userId === OWNER_ID;
+
+  const finalPrompt = mode === "clothes_swap"
+    ? "Perform a realistic clothes swap on the person in the input image. Replace the person's current outfit with clothing matching this user request: " +
+      prompt +
+      ". Keep the same person and facial identity, face, hairstyle, body proportions, pose, hands, camera angle, lighting, and background. Change the clothing only. Make the new outfit look natural, realistic, and properly fitted."
+    : prompt;
 
   if (!env.AI) {
     await send(env, chatId, "خدمة تعديل الصور غير مفعّلة حالياً.");
@@ -413,7 +426,7 @@ async function editImage(env, chatId, userId, fileId, prompt) {
     const original = await getTelegramFile(env, fileId);
 
     const form = new FormData();
-    form.append("prompt", prompt);
+    form.append("prompt", finalPrompt);
     form.append("input_image_0", original, "original.jpg");
     form.append("width", "1024");
     form.append("height", "1024");
@@ -597,7 +610,23 @@ async function handleMessage(message, env) {
     if (await finishAdminAction(env, userId, chatId, text)) return;
   }
   if (text === "🖼 تعديل صورة") {
+    await env.DB.prepare("DELETE FROM pending_modes WHERE telegram_id = ?").bind(userId).run();
     await send(env, chatId, "أرسل الصورة التي تريد تعديلها مع وصف التعديل أو أرسل الوصف بعدها.", userId === OWNER_ID ? ownerKeyboard() : userKeyboard()); return;
+  }
+
+  if (text === "👗 تبديل الملابس") {
+    await env.DB.prepare(`
+      INSERT INTO pending_modes (telegram_id, mode, created_at)
+      VALUES (?, 'clothes_swap', ?)
+      ON CONFLICT(telegram_id) DO UPDATE SET
+        mode = excluded.mode,
+        created_at = excluded.created_at
+    `).bind(userId, new Date().toISOString()).run();
+    await send(env, chatId,
+      "👗 تبديل الملابس بالذكاء الاصطناعي\nأرسل صورتك، ثم اكتب وصف الملابس التي تريد ارتداءها. يمكنك أيضاً إرسال الصورة مع الوصف في رسالة واحدة.",
+      userId === OWNER_ID ? ownerKeyboard() : userKeyboard()
+    );
+    return;
   }
   if (text === "🎁 المكافأة اليومية") text = "/daily";
   if (text === "💰 رصيدي") text = "/balance";
@@ -670,9 +699,14 @@ async function handleMessage(message, env) {
     }
 
     const caption = message.caption || "";
+    const selectedMode = await env.DB.prepare(
+      "SELECT mode FROM pending_modes WHERE telegram_id = ?"
+    ).bind(userId).first();
+    const mode = selectedMode?.mode || "normal";
 
     if (caption.length > 0) {
-      await editImage(env, chatId, userId, fileId, caption);
+      await env.DB.prepare("DELETE FROM pending_modes WHERE telegram_id = ?").bind(userId).run();
+      await editImage(env, chatId, userId, fileId, caption, mode);
     } else {
       await env.DB.prepare(`
         INSERT INTO pending_edits (telegram_id, file_id, created_at)
@@ -683,7 +717,9 @@ async function handleMessage(message, env) {
       `).bind(userId, fileId, new Date().toISOString()).run();
 
       await send(env, chatId,
-        "أرسل وصف التعديل الذي تريده على الصورة."
+        mode === "clothes_swap"
+          ? "اكتب وصف الملابس التي تريد تبديلها في الصورة."
+          : "أرسل وصف التعديل الذي تريده على الصورة."
       );
     }
     return;
@@ -707,7 +743,13 @@ async function handleMessage(message, env) {
         "DELETE FROM pending_edits WHERE telegram_id = ?"
       ).bind(userId).run();
 
-      await editImage(env, chatId, userId, pending.file_id, rawText);
+      const selectedMode = await env.DB.prepare(
+        "SELECT mode FROM pending_modes WHERE telegram_id = ?"
+      ).bind(userId).first();
+      const mode = selectedMode?.mode || "normal";
+      await env.DB.prepare("DELETE FROM pending_modes WHERE telegram_id = ?").bind(userId).run();
+
+      await editImage(env, chatId, userId, pending.file_id, rawText, mode);
       return;
     }
   }
